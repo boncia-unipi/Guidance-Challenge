@@ -391,6 +391,11 @@ def target_guidance_function(mode, t_sim, yaw):
         # Mode 2: intelligent target using a guidance law — see target_guidance_law()
         acc = target_guidance_law(t_sim, yaw)
         return acc
+    
+    elif mode == 3:
+        # Mode 3: target law based on miss distance (ZEM) — see target_miss_distance_escape()
+        acc = target_miss_distance_escape(t_sim, yaw)
+        return acc
 
 
 def acceleration_switcher(t_sim):
@@ -472,6 +477,83 @@ def target_guidance_law(t_sim, yaw):
 
     if rel_pos < 0.2:
         acc = 0.3
+
+    # Acceleration saturation
+    if acc >  0.5:
+        acc =  0.5
+    elif acc < -0.5:
+        acc = -0.5
+
+    # --- Artificial Potential Field (APF) component -------------------------
+    # If the target is close to the room boundary, override with a fixed
+    # repulsive acceleration to prevent it from exiting the tracking area.
+
+    x_max = 1.4   # Half-width of tracking area  [m]
+    y_max = 1.4   # Half-height of tracking area [m]
+
+    threshold = 0.7   # APF activates when |pos| > threshold * x/y_max
+                      # (e.g. 0.7 means the APF kicks in at 70 % of the boundary)
+
+    if (math.fabs(t_pose_x) > x_max * threshold or
+            math.fabs(t_pose_y) > y_max * threshold):
+        acc = 0.35
+
+    return acc
+
+
+# TARGET LAW BASED ON MISS DISTANCE
+
+def target_miss_distance_escape(t_sim, yaw):
+
+    # Read navigation data
+    ddata = CDA.get_drone_navdata()
+    tdata = CDA.get_target_navdata()
+    sdata = CDA.get_seeker_data()
+    edata = CDA.get_seeker_ext_data()
+
+    # Target positions
+    t_pose_x   = tdata[1]
+    t_pose_y   = tdata[2]
+    
+    # 1. Miss distance (ZEM)
+    r         = float(edata[1])
+    sigma     = float(edata[2])
+    r_dot     = float(edata[3])
+    sigma_dot = float(edata[4])
+    
+    Vc = max(-r_dot, 0.001) 
+    miss_distance = (r**2 * sigma_dot) / Vc
+
+    yaw   = wrap(yaw)
+    drone_relative_angle = wrap(sigma - yaw) 
+    # Se > 0: il drone è a SINISTRA del target
+    # Se < 0: il drone è a DESTRA del target
+    
+    # 3. LOGICA EVASIVA BASATA SU MISS DISTANCE E RANGE
+    if abs(miss_distance) < 0.3 and Vc > 0.1 and r < 1.2:
+        # Se ZEM è critico e il drone è abbastanza vicino, 
+        # vira con la MASSIMA accelerazione VERSO il drone per forzare l'overshoot.
+        if drone_relative_angle > 0:
+            acc = 0.5  # Drone a sx -> Vira tutto a sx
+        else:
+            acc = -0.5 # Drone a dx -> Vira tutto a dx
+        
+    elif r < 0.25:
+        # Fase 2 (Last-ditch): Il drone è letteralmente addosso.
+        # INVERTI brutalmente la virata per fare uno scarto all'ultimo istante.
+        if drone_relative_angle > 0:
+            acc = -0.5  # Drone a sx -> scarta a dx
+        else:
+            acc = 0.5   # Drone a dx -> scarta a sx
+        
+    else:
+        # Navigazione tattica: invece di dare le spalle, cerca di tenere 
+        # il drone a 90 gradi (di fianco). Questo costringe la ProNav del drone
+        # a faticare costantemente per chiudere la curva.
+        desired_relative = math.pi/2 if drone_relative_angle > 0 else -math.pi/2
+        error = wrap(drone_relative_angle - desired_relative)
+        kp  = 1.5
+        acc = kp * error
 
     # Acceleration saturation
     if acc >  0.5:
